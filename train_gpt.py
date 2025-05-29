@@ -321,7 +321,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-        self.sample_drop_ratio = 0.4 if layer_idx in [0, 3, 7, 11] else 0.0
+        self.sample_drop_ratio = 0.4 if layer_idx in [0, 1, 2, 3] else 0.0
         # self.ls1 = LayerScale(dim, init_values=1e-5) if layer_idx != 7 else nn.Identity()
         # self.ls2 = LayerScale(dim, init_values=1e-5)
 
