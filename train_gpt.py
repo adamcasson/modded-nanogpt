@@ -710,8 +710,9 @@ for step in range(train_steps + 1):
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
     for group in optimizer2.param_groups:
-        frac = min(step / 300, 1) # momentum warmup for muon
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # frac = min(step / 300, 1) # momentum warmup for muon
+        # group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        group["momentum"] = 0.95 - (step + 1) ** -0.8
     # step the optimizers
     for opt in optimizers:
         opt.step()
