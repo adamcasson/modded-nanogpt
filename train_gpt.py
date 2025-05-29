@@ -321,26 +321,26 @@ class Block(nn.Module):
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-        self.sample_drop_ratio = 0.0
+        self.sample_drop_ratio = 0.4
         self.ls1 = LayerScale(dim, init_values=1e-5) if layer_idx != 7 else nn.Identity()
         self.ls2 = LayerScale(dim, init_values=1e-5)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
-        # def ffn_residual_func(x: Tensor) -> Tensor:
-        #     return self.ls2(self.mlp(norm(x)))
+        def ffn_residual_func(x: Tensor) -> Tensor:
+            return self.ls2(self.mlp(norm(x)))
 
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
             x = x + self.ls1(self.attn(norm(x), ve, block_mask))
-        x = x + self.ls2(self.mlp(norm(x)))
-        # if self.training and self.sample_drop_ratio > 0.0:
-        #     x = drop_add_residual_stochastic_depth_seq(
-        #         x,
-        #         residual_func=ffn_residual_func,
-        #         sample_drop_ratio=self.sample_drop_ratio,
-        #     )
-        # else:
-        #     x = x + ffn_residual_func(x)
+        # x = x + self.ls2(self.mlp(norm(x)))
+        if self.training and self.sample_drop_ratio > 0.0:
+            x = drop_add_residual_stochastic_depth_seq(
+                x,
+                residual_func=ffn_residual_func,
+                sample_drop_ratio=self.sample_drop_ratio,
+            )
+        else:
+            x = x + ffn_residual_func(x)
         return x
     
 def drop_add_residual_stochastic_depth_seq(
