@@ -323,7 +323,7 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = 0.4
         # self.ls1 = LayerScale(dim, init_values=1e-5) if layer_idx != 7 else nn.Identity()
-        self.ls2 = LayerScale(dim, init_values=1e-5)
+        # self.ls2 = LayerScale(dim, init_values=1e-5)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         def ffn_residual_func(x: Tensor) -> Tensor:
