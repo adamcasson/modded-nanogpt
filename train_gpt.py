@@ -216,14 +216,14 @@ class LayerScale(nn.Module):
     ) -> None:
         super().__init__()
         self.init_values = init_values
-        self.gamma = nn.Parameter(torch.empty(dim), dtype=torch.bfloat16)
+        self.gamma = nn.Parameter(torch.empty(dim))
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.constant_(self.gamma, self.init_values)
 
     def forward(self, x: Tensor) -> Tensor:
-        return x * self.gamma
+        return x * self.gamma.type_as(x)
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
