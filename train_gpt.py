@@ -327,7 +327,7 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         def ffn_residual_func(x: Tensor) -> Tensor:
-            return self.ls2(self.mlp(norm(x)))
+            return self.mlp(norm(x))
 
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
