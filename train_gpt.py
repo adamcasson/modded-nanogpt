@@ -147,7 +147,7 @@ class Muon(torch.optim.Optimizer):
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, worker_group=None):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         params = list(params)
         sizes = {p.shape for p in params}
@@ -157,6 +157,7 @@ class Muon(torch.optim.Optimizer):
             group_params = [p for p in params if p.shape == size]
             param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
+        self.worker_group = worker_group
 
     @torch.no_grad()
     def step(self):
@@ -164,7 +165,15 @@ class Muon(torch.optim.Optimizer):
         # @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad,
         # @ryanyang0, and @vagrawal.
         rank = dist.get_rank()
-        world_size = dist.get_world_size()
+        if self.worker_group is not None:
+            # Use worker-specific group size for codistillation
+            world_size = dist.get_world_size(self.worker_group)
+            local_rank = dist.get_rank(self.worker_group)  # proper local rank within worker group
+        else:
+            # Standard DDP across all ranks
+            world_size = dist.get_world_size()
+            local_rank = rank
+            
         reduce_scatter_futures: list[torch.Future] = []
         all_reduce_futures: list[torch.Future] = []
         for group in self.param_groups:
@@ -172,10 +181,13 @@ class Muon(torch.optim.Optimizer):
             grad = torch.empty_like(params[-1])
             grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * world_size
             for base_i in range(0, len(params), world_size):
-                if base_i + rank < len(params):
-                    grad = params[base_i + rank].grad
+                if base_i + local_rank < len(params):
+                    grad = params[base_i + local_rank].grad
                 # This gives strange dynamo warnings
-                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
+                if self.worker_group is not None:
+                    reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True, group=self.worker_group).get_future())
+                else:
+                    reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
 
         idx = 0
         for group in self.param_groups:
@@ -184,8 +196,8 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             for base_i in range(0, len(params), world_size):
                 reduce_scatter_futures[idx].wait()
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
+                if base_i + local_rank < len(params):
+                    p = params[base_i + local_rank]
                     grad = p.grad
                     eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5 * getattr(p, "lr_mul", 1.0)
                     eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
@@ -199,11 +211,14 @@ class Muon(torch.optim.Optimizer):
                     v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
                     p.add_(other=v, alpha=-eff_lr)
                 idx += 1
-                all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank], async_op=True).get_future())
+                if self.worker_group is not None:
+                    all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + local_rank], async_op=True, group=self.worker_group).get_future())
+                else:
+                    all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + local_rank], async_op=True).get_future())
         torch.futures.collect_all(all_reduce_futures).wait()
 
 class DistAdam(torch.optim.Optimizer):
-    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
+    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01, worker_group=None):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         params = list(params)
         sizes = {p.shape for p in params}
@@ -214,12 +229,21 @@ class DistAdam(torch.optim.Optimizer):
             param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
         # DistributedAdam implementation by @vagrawal
+        self.worker_group = worker_group
 
     @torch.compile
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
-        world_size = dist.get_world_size()
+        if self.worker_group is not None:
+            # Use worker-specific group size for codistillation
+            world_size = dist.get_world_size(self.worker_group)
+            local_rank = dist.get_rank(self.worker_group)  # proper local rank within worker group
+        else:
+            # Standard DDP across all ranks
+            world_size = dist.get_world_size()
+            local_rank = rank
+            
         reduce_scatter_futures: list[torch.Future] = []
         all_reduce_futures: list[torch.Future] = []
         grad_slices = []
@@ -230,7 +254,10 @@ class DistAdam(torch.optim.Optimizer):
                 grad = params[base_i].grad
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+                if self.worker_group is not None:
+                    reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True, group=self.worker_group).get_future())
+                else:
+                    reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
                 grad_slices.append(grad_slice)
 
         idx = 0
@@ -243,7 +270,7 @@ class DistAdam(torch.optim.Optimizer):
                 reduce_scatter_futures[idx].wait()
                 p = params[base]
                 rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+                p_slice = p[local_rank * rank_size:(local_rank + 1) * rank_size]
                 lr = group['lr'] * getattr(p, "lr_mul", 1.0)
                 state = self.state[p]
                 g_slice = grad_slices[idx]
@@ -272,7 +299,10 @@ class DistAdam(torch.optim.Optimizer):
                 update = exp_avg.div(denom).mul_(step_size)
                 p_slice.add_(other=update, alpha=-1.0)
                 idx += 1
-                all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
+                if self.worker_group is not None:
+                    all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True, group=self.worker_group).get_future())
+                else:
+                    all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
         torch.futures.collect_all(all_reduce_futures).wait()
 
 # -----------------------------------------------------------------------------
@@ -404,7 +434,10 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        pad = (-num_layers * 5) % dist.get_world_size()
+        # For codistillation, use worker group size instead of global world size
+        # This will be properly set during model initialization based on codistillation setting
+        effective_world_size = getattr(self, '_effective_world_size', 8)  # Default to 8, will be overridden
+        pad = (-num_layers * 5) % effective_world_size
         self.scalars = nn.Parameter(torch.cat([
             torch.ones(num_layers), # skip_weights
             *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
@@ -459,7 +492,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, return_logits: bool = False, return_loss: bool = True):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -492,8 +525,18 @@ class GPT(nn.Module):
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
-        return loss
+        
+        # Compute loss if needed
+        if return_loss:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
+        
+        # Return based on what's requested
+        if return_logits and return_loss:
+            return logits, loss
+        elif return_logits:
+            return logits
+        elif return_loss:
+            return loss
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -520,17 +563,27 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
         end = boundary_positions[i].item() 
         if end - start >= local_batch_size:
             starts.append(start) # append start once end pos is confirmed
-            if len(starts) == dist.get_world_size():
+            # Use effective world size (could be worker group size in codistillation)
+            effective_world_size = getattr(find_batch_starts, '_effective_world_size', dist.get_world_size())
+            if len(starts) == effective_world_size:
                 return starts, end - pos
             start = end
     assert False # increase max_batch_span if necessary
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool, effective_world_size=None, use_global_rank=False):
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    if effective_world_size is None:
+        world_size = dist.get_world_size()
+        local_rank = rank
+    else:
+        world_size = effective_world_size
+        # For codistillation: use global rank to ensure different data per worker
+        local_rank = rank if use_global_rank else rank % world_size
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
+    # Set effective world size for batch start finding
+    find_batch_starts._effective_world_size = world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
     max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
@@ -539,15 +592,109 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
             tokens, pos = _load_data_shard(next(file_iter)), 0
         if align_to_bos:
             batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
-            start_idx = batch_starts[rank]
+            start_idx = batch_starts[local_rank]
         else:
             batch_span = batch_size
-            start_idx = pos + rank * local_batch_size
+            start_idx = pos + local_rank * local_batch_size
         buf = tokens[start_idx:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
         pos += batch_span
         yield inputs, targets
+
+# -----------------------------------------------------------------------------
+# Codistillation support
+
+class CodistillationManager:
+    def __init__(self, model: nn.Module, world_size: int, rank: int, sync_every_n_steps: int, worker_group):
+        assert world_size == 8, "Codistillation requires exactly 8 GPUs (2 workers x 4 GPUs each)"
+        self.model = model
+        self.world_size = world_size
+        self.rank = rank
+        self.sync_every_n_steps = sync_every_n_steps
+        
+        # Determine worker groups: [0,1,2,3] and [4,5,6,7]
+        self.worker_id = rank // 4  # 0 or 1
+        self.peer_worker_id = 1 - self.worker_id  # 1 or 0
+        self.local_rank_in_worker = rank % 4
+        
+        # Use provided worker group instead of creating new one
+        self.worker_group = worker_group
+        
+        # Create inter-worker communication groups (rank 0 from each worker)
+        self.inter_worker_group = dist.new_group([0, 4])
+        
+        # Create peer model copy for inference
+        self.peer_model = copy.deepcopy(model)
+        self.peer_model.eval()
+        
+        # Track synchronization
+        self.last_sync_step = -1
+        
+        print(f"Rank {rank}: Worker {self.worker_id}, Peer Worker {self.peer_worker_id}")
+    
+    def should_sync(self, step: int) -> bool:
+        return step > 0 and (step - self.last_sync_step) >= self.sync_every_n_steps
+    
+    def sync_peer_model(self, step: int):
+        if not self.should_sync(step):
+            return
+            
+        # Add barrier to ensure all workers are ready for synchronization
+        if self.local_rank_in_worker == 0:
+            dist.barrier(group=self.inter_worker_group)
+            
+        # Only local rank 0 from each worker participates in inter-worker sync
+        if self.local_rank_in_worker == 0:
+            # Exchange parameters between worker leaders (rank 0 and rank 4)
+            peer_leader_rank = self.peer_worker_id * 4  # rank 0 of peer worker
+            
+            for (name, param), (_, peer_param) in zip(self.model.named_parameters(), self.peer_model.named_parameters()):
+                if param.requires_grad:
+                    # Use collective sendrecv to avoid race conditions
+                    temp_tensor = torch.empty_like(param.data)
+                    if self.worker_id == 0:
+                        # Worker 0 leader sends to worker 1, receives from worker 1
+                        req1 = dist.isend(param.data, dst=peer_leader_rank)
+                        req2 = dist.irecv(peer_param.data, src=peer_leader_rank)
+                    else:
+                        # Worker 1 leader sends to worker 0, receives from worker 0  
+                        req1 = dist.isend(param.data, dst=peer_leader_rank)
+                        req2 = dist.irecv(peer_param.data, src=peer_leader_rank)
+                    req1.wait()
+                    req2.wait()
+        
+        # Broadcast peer model parameters within worker group
+        # The worker leader (local rank 0) broadcasts to other ranks in the worker
+        worker_leader_rank = self.worker_id * 4
+        for peer_param in self.peer_model.parameters():
+            if peer_param.requires_grad:
+                dist.broadcast(peer_param.data, src=worker_leader_rank, group=self.worker_group)
+        
+        self.last_sync_step = step
+        if self.local_rank_in_worker == 0:  # Only log from worker leaders to reduce noise
+            print(f"Rank {self.rank}: Synced peer model at step {step}")
+    
+    def compute_distillation_loss(self, inputs: Tensor, targets: Tensor, 
+                                sliding_window_num_blocks: Tensor,
+                                alpha: float, temperature: float) -> Tensor:
+        # Get both student logits and CE loss from model (single forward pass)
+        student_logits, ce_loss = self.model(inputs, targets, sliding_window_num_blocks, return_logits=True, return_loss=True)
+        
+        # Get teacher logits from peer model (inference only)  
+        with torch.no_grad():
+            teacher_logits = self.peer_model(inputs, targets, sliding_window_num_blocks, return_logits=True, return_loss=False)
+        
+        # Compute distillation loss using cross-entropy with soft targets (as per codistillation paper)
+        # "treating the teacher predictive distribution as soft targets"
+        teacher_soft_targets = F.softmax(teacher_logits / temperature, dim=-1)
+        distill_loss = F.cross_entropy(student_logits / temperature, 
+                                     teacher_soft_targets, 
+                                     reduction='sum')
+        
+        # Combine losses
+        total_loss = (1 - alpha) * ce_loss + alpha * distill_loss
+        return total_loss
 
 # -----------------------------------------------------------------------------
 # int main
@@ -566,6 +713,11 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    # codistillation
+    enable_codistillation = True # enable codistillation training
+    distillation_alpha = 0.5 # weight for distillation loss (1-alpha for CE loss)
+    distillation_temperature = 4.0 # temperature for softmax in distillation
+    sync_every_n_steps = 10 # sync peer model parameters every N steps
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -577,21 +729,32 @@ device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
-master_process = (rank == 0) # this process will do logging, checkpointing etc.
+# Worker-aware logging for codistillation
+if args.enable_codistillation:
+    master_process = (rank % 4 == 0)  # Leaders of each worker group log
+    worker_id = rank // 4
+    log_prefix = f"Worker{worker_id}_"
+else:
+    master_process = (rank == 0)  # Standard: only rank 0 logs
+    log_prefix = ""
 
 # begin logging
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
     os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    if args.enable_codistillation:
+        logfile = f"logs/{log_prefix}{run_id}.txt"
+    else:
+        logfile = f"logs/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
+            log_msg = f"{log_prefix}{s}"
             if console:
-                print(s)
-            print(s, file=f)
+                print(log_msg)
+            print(log_msg, file=f)
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -606,11 +769,27 @@ print0(nvidia_smi())
 print0("="*100)
 
 model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+# Set effective world size for padding calculation
+if args.enable_codistillation:
+    model._effective_world_size = 4  # Worker group size
+else:
+    model._effective_world_size = dist.get_world_size()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
-for param in model.parameters():
-    dist.broadcast(param.detach(), 0)
+# Create worker groups once for reuse throughout training
+worker_groups = {}
+if args.enable_codistillation:
+    worker_id = rank // 4
+    worker_root = worker_id * 4  # rank 0 or 4
+    worker_groups['worker'] = dist.new_group(list(range(worker_id * 4, (worker_id + 1) * 4)))
+    # Broadcast model parameters within worker groups for codistillation
+    for param in model.parameters():
+        dist.broadcast(param.detach(), worker_root, group=worker_groups['worker'])
+else:
+    # Standard: broadcast from rank 0 to all ranks
+    for param in model.parameters():
+        dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
@@ -621,8 +800,14 @@ head_params = [model.lm_head.weight]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+if args.enable_codistillation:
+    # Use worker groups for codistillation
+    optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, worker_group=worker_groups['worker'])
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0, worker_group=worker_groups['worker'])
+else:
+    # Standard DDP across all ranks
+    optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -650,6 +835,13 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
+# Initialize codistillation manager
+codistillation_manager = None
+if args.enable_codistillation:
+    codistillation_manager = CodistillationManager(
+        model, world_size, rank, args.sync_every_n_steps, worker_groups['worker']
+    )
+
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
@@ -660,9 +852,14 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+if args.enable_codistillation:
+    effective_world_size = 4
+    train_loader = distributed_data_generator(args.train_files, effective_world_size * args.train_seq_len, align_to_bos=True, effective_world_size=effective_world_size, use_global_rank=True)
+else:
+    train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
+    # Use regular loss for warmup (not distillation)
     model(inputs, targets, get_window_size_blocks(1)).backward()
     for opt in optimizers:
         opt.step()
@@ -670,13 +867,20 @@ for _ in range(warmup_steps):
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
+# Also reset codistillation manager peer model
+if codistillation_manager is not None:
+    codistillation_manager.peer_model.load_state_dict(initial_state["model"])
 del train_loader, initial_state
 
 ########################################
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+if args.enable_codistillation:
+    effective_world_size = 4
+    train_loader = distributed_data_generator(args.train_files, effective_world_size * args.train_seq_len, align_to_bos=True, effective_world_size=effective_world_size, use_global_rank=True)
+else:
+    train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -692,10 +896,18 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_batch_size = world_size * args.val_seq_len
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        if args.enable_codistillation:
+            val_effective_world_size = 4
+            val_batch_size = val_effective_world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            # For validation: use worker-local rank so both workers see SAME data for fair comparison
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False, effective_world_size=val_effective_world_size, use_global_rank=False)
+        else:
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -703,7 +915,11 @@ for step in range(train_steps + 1):
                 val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
         del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        # Use worker-specific all-reduce for codistillation
+        if args.enable_codistillation:
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG, group=worker_groups['worker'])
+        else:
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
@@ -720,7 +936,22 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    
+    # Sync peer model if needed
+    if codistillation_manager is not None:
+        codistillation_manager.sync_peer_model(step)
+    
+    # Compute loss (with distillation if enabled)
+    if codistillation_manager is not None and step > 0:  # Skip distillation on first step
+        loss = codistillation_manager.compute_distillation_loss(
+            inputs, targets, get_window_size_blocks(step),
+            args.distillation_alpha, args.distillation_temperature
+        )
+    else:
+        loss = model(inputs, targets, get_window_size_blocks(step))
+    
+    loss.backward()
+    
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
