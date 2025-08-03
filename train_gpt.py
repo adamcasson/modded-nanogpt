@@ -586,7 +586,9 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
     find_batch_starts._effective_world_size = world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    # Increase buffer when use_global_rank=True since we need more document boundaries
+    span_multiplier = 4 if (align_to_bos and use_global_rank) else 2 if align_to_bos else 1
+    max_batch_span = span_multiplier * batch_size
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
