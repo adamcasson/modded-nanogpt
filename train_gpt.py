@@ -554,7 +554,7 @@ def _load_data_shard(file: Path):
     return tokens
 
 # find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
-def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int, required_starts=None):
     boundary_mask = tokens[pos : pos + max_batch_span] == 50256
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
@@ -563,9 +563,9 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
         end = boundary_positions[i].item() 
         if end - start >= local_batch_size:
             starts.append(start) # append start once end pos is confirmed
-            # Use effective world size (could be worker group size in codistillation)
-            effective_world_size = getattr(find_batch_starts, '_effective_world_size', dist.get_world_size())
-            if len(starts) == effective_world_size:
+            # Use required_starts if provided, otherwise fall back to effective world size
+            target_starts = required_starts if required_starts is not None else getattr(find_batch_starts, '_effective_world_size', dist.get_world_size())
+            if len(starts) == target_starts:
                 return starts, end - pos
             start = end
     assert False # increase max_batch_span if necessary
@@ -591,7 +591,9 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
         if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
+            # When use_global_rank=True, we need batch starts for all global ranks, not just effective_world_size
+            required_starts = dist.get_world_size() if use_global_rank else world_size
+            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span, required_starts)
             start_idx = batch_starts[local_rank]
         else:
             batch_span = batch_size
