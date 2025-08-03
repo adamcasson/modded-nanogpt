@@ -311,6 +311,23 @@ class DistAdam(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+class LayerScale(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        init_values: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.init_values = init_values
+        self.gamma = nn.Parameter(torch.empty(dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.constant_(self.gamma, self.init_values)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * self.gamma.type_as(x)
+
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
@@ -412,6 +429,34 @@ class Block(nn.Module):
             x = x + self.attn(norm(x), ve, sa_lambdas, block_mask)
         x = x + self.mlp(norm(x))
         return x
+    
+def drop_add_residual_stochastic_depth_seq(
+    x: Tensor,
+    residual_func,
+    sample_drop_ratio: float = 0.0,
+) -> Tensor:
+    b, n, d = x.shape
+
+    # 1) pick which sequence positions participate this step
+    subset_size = max(int(n * (1.0 - sample_drop_ratio)), 1)
+    seq_idx = torch.randperm(n, device=x.device)[:subset_size]  # (subset_size,)
+
+    # 2) run the residual branch only on those positions
+    x_subset = x[:, seq_idx, :]                         # (b, subset_size, d)
+    residual = residual_func(x_subset)                  # (b, subset_size, d)
+
+    # 3) rescale so E[output] == x
+    scale = n / subset_size
+
+    # 4) add the residual back on the same positions
+    out = torch.index_add(
+        x,                       # original tensor
+        dim=1,                   # sequence dimension
+        index=seq_idx,
+        source=residual.to(dtype=x.dtype),
+        alpha=scale,
+    )
+    return out
 
 # -----------------------------------------------------------------------------
 # The main model
