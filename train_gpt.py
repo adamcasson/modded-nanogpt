@@ -873,7 +873,11 @@ for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 # Also reset codistillation manager peer model
 if codistillation_manager is not None:
-    codistillation_manager.peer_model.load_state_dict(initial_state["model"])
+    # Strip _orig_mod prefix from compiled model state dict keys
+    peer_state_dict = initial_state["model"]
+    if any(key.startswith("_orig_mod.") for key in peer_state_dict.keys()):
+        peer_state_dict = {key.replace("_orig_mod.", ""): value for key, value in peer_state_dict.items()}
+    codistillation_manager.peer_model.load_state_dict(peer_state_dict)
 del train_loader, initial_state
 
 ########################################
