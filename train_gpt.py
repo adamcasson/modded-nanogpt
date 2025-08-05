@@ -492,7 +492,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, return_logits: bool = False, return_loss: bool = True):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, return_logits: bool = False, return_loss: bool = True, teacher_soft_targets: Tensor = None, distill_alpha: float = None, distill_temp: float = None):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -528,7 +528,15 @@ class GPT(nn.Module):
         
         # Compute loss if needed
         if return_loss:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
+            
+            # Add distillation loss if teacher soft targets provided
+            if teacher_soft_targets is not None and distill_alpha is not None and distill_temp is not None:
+                # Compute distillation loss using cross-entropy with pre-computed soft targets
+                distill_loss = F.cross_entropy(logits / distill_temp, teacher_soft_targets, reduction='sum')
+                loss = (1 - distill_alpha) * ce_loss + distill_alpha * distill_loss
+            else:
+                loss = ce_loss
         
         # Return based on what's requested
         if return_logits and return_loss:
@@ -682,23 +690,16 @@ class CodistillationManager:
     def compute_distillation_loss(self, inputs: Tensor, targets: Tensor, 
                                 sliding_window_num_blocks: Tensor,
                                 alpha: float, temperature: float) -> Tensor:
-        # Get both student logits and CE loss from model (single forward pass)
-        student_logits, ce_loss = self.model(inputs, targets, sliding_window_num_blocks, return_logits=True, return_loss=True)
-        
-        # Get teacher logits from peer model (inference only)  
+        # Get teacher logits and compute soft targets (inference only)  
         with torch.no_grad():
             teacher_logits = self.peer_model(inputs, targets, sliding_window_num_blocks, return_logits=True, return_loss=False)
+            teacher_soft_targets = F.softmax(teacher_logits / temperature, dim=-1)
         
-        # Compute distillation loss using cross-entropy with soft targets (as per codistillation paper)
-        # "treating the teacher predictive distribution as soft targets"
-        teacher_soft_targets = F.softmax(teacher_logits / temperature, dim=-1)
-        distill_loss = F.cross_entropy(student_logits / temperature, 
-                                     teacher_soft_targets, 
-                                     reduction='sum')
+        # Student forward pass with distillation (compiled together)
+        loss = self.model(inputs, targets, sliding_window_num_blocks, return_loss=True, 
+                         teacher_soft_targets=teacher_soft_targets, distill_alpha=alpha, distill_temp=temperature)
         
-        # Combine losses
-        total_loss = (1 - alpha) * ce_loss + alpha * distill_loss
-        return total_loss
+        return loss
 
 # -----------------------------------------------------------------------------
 # int main
