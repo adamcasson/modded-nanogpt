@@ -721,6 +721,7 @@ class Hyperparameters:
     enable_codistillation = True # enable codistillation training
     distillation_alpha = 0.5 # weight for distillation loss (1-alpha for CE loss)
     distillation_temperature = 4.0 # temperature for softmax in distillation
+    codistillation_burn_in = 100 # train without distillation for N steps to let models diverge
     sync_every_n_steps = 10 # sync peer model parameters every N steps
 args = Hyperparameters()
 
@@ -839,14 +840,13 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-# Initialize codistillation manager
+model: nn.Module = torch.compile(model, dynamic=False)
+
 codistillation_manager = None
 if args.enable_codistillation:
     codistillation_manager = CodistillationManager(
         model, world_size, rank, args.sync_every_n_steps, worker_groups['worker']
     )
-
-model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
 #            Warmup kernels            #
@@ -863,8 +863,15 @@ else:
     train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    # Use regular loss for warmup (not distillation)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
+    # Use same loss path as training to warm up all kernels
+    if codistillation_manager is not None:
+        loss = codistillation_manager.compute_distillation_loss(
+            inputs, targets, get_window_size_blocks(1),
+            args.distillation_alpha, args.distillation_temperature
+        )
+    else:
+        loss = model(inputs, targets, get_window_size_blocks(1))
+    loss.backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -873,11 +880,7 @@ for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 # Also reset codistillation manager peer model
 if codistillation_manager is not None:
-    # Strip _orig_mod prefix from compiled model state dict keys
-    peer_state_dict = initial_state["model"]
-    if any(key.startswith("_orig_mod.") for key in peer_state_dict.keys()):
-        peer_state_dict = {key.replace("_orig_mod.", ""): value for key, value in peer_state_dict.items()}
-    codistillation_manager.peer_model.load_state_dict(peer_state_dict)
+    codistillation_manager.peer_model.load_state_dict(initial_state["model"])
 del train_loader, initial_state
 
 ########################################
@@ -949,8 +952,8 @@ for step in range(train_steps + 1):
     if codistillation_manager is not None:
         codistillation_manager.sync_peer_model(step)
     
-    # Compute loss (with distillation if enabled)
-    if codistillation_manager is not None and step > 0:  # Skip distillation on first step
+    # Compute loss (with distillation if enabled after burn-in period)
+    if codistillation_manager is not None and step > args.codistillation_burn_in:
         loss = codistillation_manager.compute_distillation_loss(
             inputs, targets, get_window_size_blocks(step),
             args.distillation_alpha, args.distillation_temperature
