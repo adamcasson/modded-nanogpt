@@ -633,9 +633,6 @@ class CodistillationManager:
         # Use provided worker group instead of creating new one
         self.worker_group = worker_group
         
-        # Create inter-worker communication groups (rank 0 from each worker)
-        self.inter_worker_group = dist.new_group([0, 4])
-        
         # Create peer model copy for inference
         self.peer_model = copy.deepcopy(model)
         self.peer_model.eval()
@@ -652,40 +649,25 @@ class CodistillationManager:
         if not self.should_sync(step):
             return
             
-        # Add barrier to ensure all workers are ready for synchronization
-        if self.local_rank_in_worker == 0:
-            dist.barrier(group=self.inter_worker_group)
-            
-        # Only local rank 0 from each worker participates in inter-worker sync
-        if self.local_rank_in_worker == 0:
-            # Exchange parameters between worker leaders (rank 0 and rank 4)
-            peer_leader_rank = self.peer_worker_id * 4  # rank 0 of peer worker
-            
-            for (name, param), (_, peer_param) in zip(self.model.named_parameters(), self.peer_model.named_parameters()):
-                if param.requires_grad:
-                    # Use collective sendrecv to avoid race conditions
-                    temp_tensor = torch.empty_like(param.data)
-                    if self.worker_id == 0:
-                        # Worker 0 leader sends to worker 1, receives from worker 1
-                        req1 = dist.isend(param.data, dst=peer_leader_rank)
-                        req2 = dist.irecv(peer_param.data, src=peer_leader_rank)
-                    else:
-                        # Worker 1 leader sends to worker 0, receives from worker 0  
-                        req1 = dist.isend(param.data, dst=peer_leader_rank)
-                        req2 = dist.irecv(peer_param.data, src=peer_leader_rank)
-                    req1.wait()
-                    req2.wait()
+        # Ring exchange: All ranks participate in parallel
+        # Rank 0↔4, 1↔5, 2↔6, 3↔7
+        peer_rank = self.rank + (4 if self.worker_id == 0 else -4)
         
-        # Broadcast peer model parameters within worker group
-        # The worker leader (local rank 0) broadcasts to other ranks in the worker
-        worker_leader_rank = self.worker_id * 4
-        for peer_param in self.peer_model.parameters():
-            if peer_param.requires_grad:
-                dist.broadcast(peer_param.data, src=worker_leader_rank, group=self.worker_group)
+        # Exchange all parameters with peer rank
+        exchange_requests = []
+        for param, peer_param in zip(self.model.parameters(), self.peer_model.parameters()):
+            if param.requires_grad:
+                req1 = dist.isend(param.data, dst=peer_rank)
+                req2 = dist.irecv(peer_param.data, src=peer_rank)
+                exchange_requests.extend([req1, req2])
+        
+        # Wait for all exchanges to complete
+        for req in exchange_requests:
+            req.wait()
         
         self.last_sync_step = step
         if self.local_rank_in_worker == 0:  # Only log from worker leaders to reduce noise
-            print(f"Rank {self.rank}: Synced peer model at step {step}")
+            print(f"Rank {self.rank}: Ring synced peer model at step {step}")
     
     def compute_distillation_loss(self, inputs: Tensor, targets: Tensor, 
                                 sliding_window_num_blocks: Tensor,
