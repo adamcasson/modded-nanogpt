@@ -666,8 +666,8 @@ class CodistillationManager:
             req.wait()
         
         self.last_sync_step = step
-        if self.local_rank_in_worker == 0:  # Only log from worker leaders to reduce noise
-            print(f"Rank {self.rank}: Ring synced peer model at step {step}")
+        # if self.local_rank_in_worker == 0:  # Only log from worker leaders to reduce noise
+        print(f"Rank {self.rank}: Ring synced peer model at step {step}")
     
     def compute_distillation_loss(self, inputs: Tensor, targets: Tensor, 
                                 sliding_window_num_blocks: Tensor,
