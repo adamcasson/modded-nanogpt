@@ -653,17 +653,19 @@ class CodistillationManager:
         # Rank 0↔4, 1↔5, 2↔6, 3↔7
         peer_rank = self.rank + (4 if self.worker_id == 0 else -4)
         
-        # Exchange all parameters with peer rank
-        exchange_requests = []
-        for param, peer_param in zip(self.model.parameters(), self.peer_model.parameters()):
-            if param.requires_grad:
-                req1 = dist.isend(param.data, dst=peer_rank)
-                req2 = dist.irecv(peer_param.data, src=peer_rank)
-                exchange_requests.extend([req1, req2])
-        
-        # Wait for all exchanges to complete
-        for req in exchange_requests:
-            req.wait()
+        # Use ordered synchronous send/recv to prevent deadlock
+        if self.rank < peer_rank:
+            # Lower rank sends first, then receives
+            for param, peer_param in zip(self.model.parameters(), self.peer_model.parameters()):
+                if param.requires_grad:
+                    dist.send(param.data, dst=peer_rank)
+                    dist.recv(peer_param.data, src=peer_rank)
+        else:
+            # Higher rank receives first, then sends
+            for param, peer_param in zip(self.model.parameters(), self.peer_model.parameters()):
+                if param.requires_grad:
+                    dist.recv(peer_param.data, src=peer_rank)
+                    dist.send(param.data, dst=peer_rank)
         
         self.last_sync_step = step
         # if self.local_rank_in_worker == 0:  # Only log from worker leaders to reduce noise
@@ -955,10 +957,8 @@ for step in range(train_steps + 1):
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     print(f"Rank {rank}: About to step optimizers at step {step}")
-    # Add global barrier before optimizer steps 
-    print(f"Rank {rank}: Entering global barrier at step {step}")
-    dist.barrier()
-    print(f"Rank {rank}: Passed global barrier at step {step}")
+    # Remove barrier completely - let optimizers handle their own synchronization
+    print(f"Rank {rank}: Skipping barrier, proceeding to optimizers at step {step}")
     print(f"Rank {rank}: Passed optimizer barrier at step {step}")
     # step the optimizers
     for i, opt in enumerate(optimizers):
