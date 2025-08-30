@@ -648,10 +648,6 @@ class CodistillationManager:
     def sync_peer_model(self, step: int):
         if not self.should_sync(step):
             return
-        
-        # Add barrier to ensure all ranks are ready before exchange
-        # Use global barrier since peer exchange crosses worker groups
-        dist.barrier()
             
         # Ring exchange: All ranks participate in parallel
         # Rank 0↔4, 1↔5, 2↔6, 3↔7
