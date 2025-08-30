@@ -959,15 +959,10 @@ for step in range(train_steps + 1):
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     print(f"Rank {rank}: About to step optimizers at step {step}")
-    # Add barrier before optimizer steps to ensure worker group synchronization
-    if args.enable_codistillation:
-        print(f"Rank {rank}: Entering worker group barrier at step {step}")
-        dist.barrier(group=worker_groups['worker'])
-        print(f"Rank {rank}: Passed worker group barrier at step {step}")
-    else:
-        print(f"Rank {rank}: Entering global barrier at step {step}")
-        dist.barrier()
-        print(f"Rank {rank}: Passed global barrier at step {step}")
+    # Add global barrier before optimizer steps 
+    print(f"Rank {rank}: Entering global barrier at step {step}")
+    dist.barrier()
+    print(f"Rank {rank}: Passed global barrier at step {step}")
     print(f"Rank {rank}: Passed optimizer barrier at step {step}")
     # step the optimizers
     for i, opt in enumerate(optimizers):
