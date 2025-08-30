@@ -650,6 +650,7 @@ class CodistillationManager:
             return
         
         # Add barrier to ensure all ranks are ready before exchange
+        # Use global barrier since peer exchange crosses worker groups
         dist.barrier()
             
         # Ring exchange: All ranks participate in parallel
@@ -960,9 +961,13 @@ for step in range(train_steps + 1):
     print(f"Rank {rank}: About to step optimizers at step {step}")
     # Add barrier before optimizer steps to ensure worker group synchronization
     if args.enable_codistillation:
+        print(f"Rank {rank}: Entering worker group barrier at step {step}")
         dist.barrier(group=worker_groups['worker'])
+        print(f"Rank {rank}: Passed worker group barrier at step {step}")
     else:
+        print(f"Rank {rank}: Entering global barrier at step {step}")
         dist.barrier()
+        print(f"Rank {rank}: Passed global barrier at step {step}")
     print(f"Rank {rank}: Passed optimizer barrier at step {step}")
     # step the optimizers
     for i, opt in enumerate(optimizers):
