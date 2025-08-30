@@ -947,7 +947,7 @@ for step in range(train_steps + 1):
         loss = model(inputs, targets, get_window_size_blocks(step))
     
     loss.backward()
-    print(f"Rank {rank}: Completed backward pass at step {step}")
+    # print(f"Rank {rank}: Completed backward pass at step {step}")
     
     # set optimization hyperparameters
     for opt in optimizers:
@@ -956,15 +956,15 @@ for step in range(train_steps + 1):
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    print(f"Rank {rank}: About to step optimizers at step {step}")
+    # print(f"Rank {rank}: About to step optimizers at step {step}")
     # Remove barrier completely - let optimizers handle their own synchronization
-    print(f"Rank {rank}: Skipping barrier, proceeding to optimizers at step {step}")
-    print(f"Rank {rank}: Passed optimizer barrier at step {step}")
+    # print(f"Rank {rank}: Skipping barrier, proceeding to optimizers at step {step}")
+    # print(f"Rank {rank}: Passed optimizer barrier at step {step}")
     # step the optimizers
     for i, opt in enumerate(optimizers):
-        print(f"Rank {rank}: Stepping optimizer {i} at step {step}")
+        # print(f"Rank {rank}: Stepping optimizer {i} at step {step}")
         opt.step()
-        print(f"Rank {rank}: Completed optimizer {i} step at step {step}")
+        # print(f"Rank {rank}: Completed optimizer {i} step at step {step}")
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
