@@ -712,7 +712,7 @@ class Hyperparameters:
     enable_codistillation = True # enable codistillation training
     distillation_alpha = 0.5 # weight for distillation loss (1-alpha for CE loss)
     distillation_temperature = 1.0 # temperature for softmax in distillation
-    codistillation_burn_in = 1600 # train without distillation for N steps to let models diverge
+    codistillation_burn_in = 50 # train without distillation for N steps to let models diverge
     sync_every_n_steps = 50 # sync peer model parameters every N steps
 args = Hyperparameters()
 
