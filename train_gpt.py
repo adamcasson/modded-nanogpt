@@ -671,11 +671,11 @@ class CodistillationManager:
         # if self.local_rank_in_worker == 0:  # Only log from worker leaders to reduce noise
         print(f"Rank {self.rank}: Ring synced peer model at step {step}")
         
-        # Sanity check: print first 10 weights from layer 3 MLP to verify sync
-        student_weights = self.model.blocks[3].mlp.c_fc.weight.data.flatten()[:10]
-        teacher_weights = self.peer_model.blocks[3].mlp.c_fc.weight.data.flatten()[:10]
-        print(f"Rank {self.rank} Student L3 MLP weights: {student_weights}")
-        print(f"Rank {self.rank} Teacher L3 MLP weights: {teacher_weights}")
+        # # Sanity check: print first 10 weights from layer 3 MLP to verify sync
+        # student_weights = self.model.blocks[3].mlp.c_fc.weight.data.flatten()[:10]
+        # teacher_weights = self.peer_model.blocks[3].mlp.c_fc.weight.data.flatten()[:10]
+        # print(f"Rank {self.rank} Student L3 MLP weights: {student_weights}")
+        # print(f"Rank {self.rank} Teacher L3 MLP weights: {teacher_weights}")
     
     def compute_distillation_loss(self, inputs: Tensor, targets: Tensor, 
                                 sliding_window_num_blocks: Tensor,
